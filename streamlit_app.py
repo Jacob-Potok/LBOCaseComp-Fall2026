@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import html
+import base64
 import io
 import json
 import mimetypes
 import os
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,8 @@ APP_FILES = {"streamlit_app.py", "requirements.txt", ".gitignore", "STREAMLIT_SE
 IGNORED_DIRS = {".git", ".streamlit", "__pycache__", ".venv", "venv"}
 GITHUB_REPO_DEFAULT = "Jacob-Potok/LBOCaseComp-Fall2026"
 TEAM_POST_MARKER = "<!-- lbo-case-team-post -->"
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+UPLOAD_EXTENSIONS = ["pdf", "xlsx", "xls", "csv", "tsv", "pptx", "docx", "md", "txt", "png", "jpg", "jpeg", "webp", "mp4", "mp3", "wav"]
 
 st.set_page_config(
     page_title="LBO Case Comp | Team Library",
@@ -93,10 +97,59 @@ def github_api(repo: str, endpoint: str, token: str, method: str = "GET", payloa
         if exc.code == 410:
             return None, "GitHub Issues are disabled for this repository. Enable Issues in repository settings to collect feedback."
         if exc.code in {401, 403, 404}:
-            return None, "The app cannot access the feedback store. Check its GitHub token and repository permissions."
+            return None, "The app cannot access GitHub. Check that its token has Contents read/write and Issues read/write access to this repository."
         return None, f"GitHub did not accept the request ({exc.code}). {detail}".strip()
     except (URLError, TimeoutError, ValueError, OSError):
         return None, "Could not reach GitHub. Please try again in a moment."
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def remote_attachment_bytes(repo: str, path: str, token: str, branch: str) -> bytes | None:
+    url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}"
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github.raw+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "lbo-case-comp-library",
+        },
+    )
+    try:
+        with urlopen(request, timeout=12) as response:
+            return response.read()
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return None
+
+
+def upload_blog_attachment(repo: str, token: str, branch: str, uploaded_file) -> tuple[str | None, str | None]:
+    """Save an approved, size-limited attachment under blog-attachments/."""
+    original_name = Path(uploaded_file.name).name
+    extension = Path(original_name).suffix.lower().lstrip(".")
+    if extension not in UPLOAD_EXTENSIONS:
+        return None, "That file type is not supported. Choose a document, spreadsheet, presentation, image, or supported audio/video file."
+    file_bytes = uploaded_file.getvalue()
+    if not file_bytes:
+        return None, "The selected file is empty."
+    if len(file_bytes) > MAX_ATTACHMENT_BYTES:
+        return None, "Attachments must be 10 MB or smaller."
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", original_name).strip(".-_") or f"attachment.{extension}"
+    target_path = f"blog-attachments/{uuid.uuid4().hex[:12]}-{safe_name}"
+    payload = {
+        "message": f"Add blog attachment: {safe_name}",
+        "content": base64.b64encode(file_bytes).decode("ascii"),
+        "branch": branch,
+    }
+    result, error = github_api(
+        repo,
+        f"contents/{quote(target_path, safe='/')}",
+        token,
+        method="PUT",
+        payload=payload,
+    )
+    if error:
+        return None, error
+    return (result.get("content") or {}).get("path", target_path), None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -178,7 +231,7 @@ def save_feedback(repo: str, item: dict, token: str, comment_body: str) -> tuple
     return True, "Thanks — your feedback has been added to this file's discussion."
 
 
-def render_team_posts(repo: str, token: str, content_items: list[dict]) -> None:
+def render_team_posts(repo: str, token: str, branch: str, content_items: list[dict]) -> None:
     st.markdown("## Team posts")
     st.caption("Share case updates, questions, and ideas with the group. New posts appear first.")
 
@@ -208,6 +261,13 @@ def render_team_posts(repo: str, token: str, content_items: list[dict]) -> None:
                     format_func=lambda path: f"{item_by_path[path]['name']} · {human_size(item_by_path[path]['size'])}",
                     help="Files already in this GitHub repository are available here.",
                 )
+                st.caption("People with access to this site can publish posts and upload an attachment, which is saved in the GitHub repository.")
+                uploaded_file = st.file_uploader(
+                    "Or upload an attachment from your computer",
+                    type=UPLOAD_EXTENSIONS,
+                    accept_multiple_files=False,
+                    help="One file per post; maximum 10 MB. Uploads are saved to the repository's blog-attachments folder.",
+                )
                 post_body = st.text_area(
                     "Post",
                     max_chars=8000,
@@ -223,24 +283,32 @@ def render_team_posts(repo: str, token: str, content_items: list[dict]) -> None:
                 if not clean_title or not clean_body:
                     st.error("Add both a title and a post before publishing.")
                 else:
-                    author = html.escape(post_author.strip()) if post_author.strip() else "Guest"
-                    attachment_tags = "\n".join(
-                        f"<!-- lbo-case-attachment:{path} -->" for path in attachment_paths
-                    )
-                    issue_body = (
-                        f"{TEAM_POST_MARKER}\n\n"
-                        f"{attachment_tags}\n\n"
-                        f"**Posted by:** {author}\n\n"
-                        f"{clean_body}"
-                    )
+                    all_attachment_paths = list(attachment_paths)
                     with st.spinner("Publishing your post…"):
-                        _, error = github_api(
-                            repo,
-                            "issues",
-                            token,
-                            method="POST",
-                            payload={"title": f"[Team post] {clean_title}"[:240], "body": issue_body},
-                        )
+                        if uploaded_file is not None:
+                            uploaded_path, error = upload_blog_attachment(repo, token, branch, uploaded_file)
+                            if uploaded_path:
+                                all_attachment_paths.append(uploaded_path)
+                        else:
+                            error = None
+                        if not error:
+                            author = html.escape(post_author.strip()) if post_author.strip() else "Guest"
+                            attachment_tags = "\n".join(
+                                f"<!-- lbo-case-attachment:{path} -->" for path in all_attachment_paths
+                            )
+                            issue_body = (
+                                f"{TEAM_POST_MARKER}\n\n"
+                                f"{attachment_tags}\n\n"
+                                f"**Posted by:** {author}\n\n"
+                                f"{clean_body}"
+                            )
+                            _, error = github_api(
+                                repo,
+                                "issues",
+                                token,
+                                method="POST",
+                                payload={"title": f"[Team post] {clean_title}"[:240], "body": issue_body},
+                            )
                     if error:
                         st.error(error)
                     else:
@@ -270,28 +338,33 @@ def render_team_posts(repo: str, token: str, content_items: list[dict]) -> None:
                 if posted_at:
                     st.caption(posted_at)
                 st.markdown(body)
-                available_attachments = [item_by_path[path] for path in attachment_paths if path in item_by_path]
-                if available_attachments:
+                if attachment_paths:
                     st.markdown("**Attachments**")
-                    for attachment_index, attachment in enumerate(available_attachments):
+                    for attachment_index, attachment_path in enumerate(attachment_paths):
+                        attachment = item_by_path.get(attachment_path)
+                        attachment_name = Path(attachment_path).name
+                        attachment_size = human_size(attachment["size"]) if attachment else ""
                         attachment_cols = st.columns([4, 1])
-                        attachment_cols[0].write(f"📎 {attachment['relative']} · {human_size(attachment['size'])}")
+                        attachment_cols[0].write(f"📎 {attachment_name}" + (f" · {attachment_size}" if attachment_size else ""))
                         try:
-                            attachment_data = attachment["path"].read_bytes()
-                            attachment_mime = mimetypes.guess_type(attachment["name"])[0] or "application/octet-stream"
+                            attachment_data = (
+                                attachment["path"].read_bytes()
+                                if attachment
+                                else remote_attachment_bytes(repo, attachment_path, token, branch)
+                            )
+                            if attachment_data is None:
+                                raise OSError("Attachment is not available yet")
+                            attachment_mime = mimetypes.guess_type(attachment_name)[0] or "application/octet-stream"
                             attachment_cols[1].download_button(
                                 "Download",
                                 data=attachment_data,
-                                file_name=attachment["name"],
+                                file_name=attachment_name,
                                 mime=attachment_mime,
                                 key=f"post-attachment-{issue['number']}-{attachment_index}",
                                 use_container_width=True,
                             )
                         except OSError:
                             attachment_cols[1].caption("Unavailable")
-                missing_attachments = [path for path in attachment_paths if path not in item_by_path]
-                if missing_attachments:
-                    st.caption("An attached file is no longer in the project library: " + ", ".join(missing_attachments))
     elif token and not error:
         st.info("No team posts yet. Use **Write a team post** to start the conversation.")
 
@@ -588,8 +661,9 @@ st.markdown(
 
 repo = get_setting("GITHUB_REPO", GITHUB_REPO_DEFAULT).strip()
 token = get_setting("GITHUB_TOKEN").strip()
+branch = get_setting("GITHUB_BRANCH", "main").strip() or "main"
 items = list_content_files()
-render_team_posts(repo, token, items)
+render_team_posts(repo, token, branch, items)
 st.divider()
 
 if repo and items:
@@ -635,7 +709,7 @@ else:
     stat_cols[2].metric("Latest update", filtered[0]["updated"].astimezone().strftime("%b %-d, %Y") if filtered else "—")
 
     if repo and not token:
-        st.caption("The list is connected to the GitHub repository. For a private repository, add a GitHub token in Streamlit app Secrets with Contents read-only and Issues read/write access. This enables accurate update dates and persistent comments.")
+        st.caption("The list is connected to the GitHub repository. For a private repository, add a GitHub token in Streamlit app Secrets with Contents read/write and Issues read/write access. This enables upload, update dates, and persistent posts/comments.")
 
     if not filtered:
         st.info("No files match that search. Try another name or file type.")
