@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 APP_FILES = {"streamlit_app.py", "requirements.txt", ".gitignore", "STREAMLIT_SETUP.md"}
 IGNORED_DIRS = {".git", ".streamlit", "__pycache__", ".venv", "venv"}
 GITHUB_REPO_DEFAULT = "Jacob-Potok/LBOCaseComp-Fall2026"
+TEAM_POST_MARKER = "<!-- lbo-case-team-post -->"
 
 st.set_page_config(
     page_title="LBO Case Comp | Team Library",
@@ -174,6 +175,89 @@ def save_feedback(repo: str, item: dict, token: str, comment_body: str) -> tuple
         return False, error
     issue_comments.clear()
     return True, "Thanks — your feedback has been added to this file's discussion."
+
+
+def render_team_posts(repo: str, token: str) -> None:
+    st.markdown("## Team posts")
+    st.caption("Share case updates, questions, and ideas with the group. New posts appear first.")
+
+    posts: list[dict] = []
+    if token:
+        issues, error = feedback_issues(repo, token)
+        if error:
+            st.warning(error)
+        else:
+            posts = [
+                issue for issue in issues
+                if TEAM_POST_MARKER in (issue.get("body") or "")
+            ]
+            posts.sort(key=lambda issue: issue.get("created_at", ""), reverse=True)
+    else:
+        st.info("Team posts need the GitHub token in Streamlit app Secrets.")
+
+    if token:
+        with st.expander("✍️ Write a team post", expanded=False):
+            with st.form("team-post-form", clear_on_submit=True):
+                post_title = st.text_input("Title", max_chars=140, placeholder="What should the group know?")
+                post_author = st.text_input("Your name (optional)", max_chars=60)
+                post_body = st.text_area(
+                    "Post",
+                    max_chars=8000,
+                    height=180,
+                    placeholder="Write an update, share an idea, or ask the group a question…",
+                    help="You can use simple Markdown for headings, lists, and links.",
+                )
+                publish = st.form_submit_button("Publish post", type="primary")
+
+            if publish:
+                clean_title = post_title.strip()
+                clean_body = post_body.strip()
+                if not clean_title or not clean_body:
+                    st.error("Add both a title and a post before publishing.")
+                else:
+                    author = html.escape(post_author.strip()) if post_author.strip() else "Guest"
+                    issue_body = (
+                        f"{TEAM_POST_MARKER}\n\n"
+                        f"**Posted by:** {author}\n\n"
+                        f"{clean_body}"
+                    )
+                    with st.spinner("Publishing your post…"):
+                        _, error = github_api(
+                            repo,
+                            "issues",
+                            token,
+                            method="POST",
+                            payload={"title": f"[Team post] {clean_title}"[:240], "body": issue_body},
+                        )
+                    if error:
+                        st.error(error)
+                    else:
+                        feedback_issues.clear()
+                        st.session_state["team_post_notice"] = "Your post is live."
+                        st.rerun()
+
+    notice = st.session_state.pop("team_post_notice", None)
+    if notice:
+        st.success(notice)
+
+    if posts:
+        for issue in posts:
+            title = issue.get("title", "Team post")
+            if title.startswith("[Team post] "):
+                title = title.removeprefix("[Team post] ")
+            created = issue.get("created_at", "")
+            try:
+                posted_at = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone().strftime("%b %-d, %Y · %I:%M %p")
+            except ValueError:
+                posted_at = ""
+            body = (issue.get("body") or "").replace(TEAM_POST_MARKER, "", 1).strip()
+            with st.container(border=True):
+                st.markdown(f"### {title}")
+                if posted_at:
+                    st.caption(posted_at)
+                st.markdown(body)
+    elif token and not error:
+        st.info("No team posts yet. Use **Write a team post** to start the conversation.")
 
 
 def render_feedback(item: dict, repo: str, token: str) -> None:
@@ -468,6 +552,8 @@ st.markdown(
 
 repo = get_setting("GITHUB_REPO", GITHUB_REPO_DEFAULT).strip()
 token = get_setting("GITHUB_TOKEN").strip()
+render_team_posts(repo, token)
+st.divider()
 items = list_content_files()
 
 if repo and items:
