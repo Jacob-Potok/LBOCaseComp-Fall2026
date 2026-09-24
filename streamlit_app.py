@@ -5,6 +5,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,7 +178,7 @@ def save_feedback(repo: str, item: dict, token: str, comment_body: str) -> tuple
     return True, "Thanks — your feedback has been added to this file's discussion."
 
 
-def render_team_posts(repo: str, token: str) -> None:
+def render_team_posts(repo: str, token: str, content_items: list[dict]) -> None:
     st.markdown("## Team posts")
     st.caption("Share case updates, questions, and ideas with the group. New posts appear first.")
 
@@ -196,10 +197,17 @@ def render_team_posts(repo: str, token: str) -> None:
         st.info("Team posts need the GitHub token in Streamlit app Secrets.")
 
     if token:
+        item_by_path = {item["relative"]: item for item in content_items}
         with st.expander("✍️ Write a team post", expanded=False):
             with st.form("team-post-form", clear_on_submit=True):
                 post_title = st.text_input("Title", max_chars=140, placeholder="What should the group know?")
                 post_author = st.text_input("Your name (optional)", max_chars=60)
+                attachment_paths = st.multiselect(
+                    "Attach files from the project library",
+                    options=list(item_by_path),
+                    format_func=lambda path: f"{item_by_path[path]['name']} · {human_size(item_by_path[path]['size'])}",
+                    help="Files already in this GitHub repository are available here.",
+                )
                 post_body = st.text_area(
                     "Post",
                     max_chars=8000,
@@ -216,8 +224,12 @@ def render_team_posts(repo: str, token: str) -> None:
                     st.error("Add both a title and a post before publishing.")
                 else:
                     author = html.escape(post_author.strip()) if post_author.strip() else "Guest"
+                    attachment_tags = "\n".join(
+                        f"<!-- lbo-case-attachment:{path} -->" for path in attachment_paths
+                    )
                     issue_body = (
                         f"{TEAM_POST_MARKER}\n\n"
+                        f"{attachment_tags}\n\n"
                         f"**Posted by:** {author}\n\n"
                         f"{clean_body}"
                     )
@@ -250,12 +262,36 @@ def render_team_posts(repo: str, token: str) -> None:
                 posted_at = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone().strftime("%b %-d, %Y · %I:%M %p")
             except ValueError:
                 posted_at = ""
-            body = (issue.get("body") or "").replace(TEAM_POST_MARKER, "", 1).strip()
+            raw_body = (issue.get("body") or "").replace(TEAM_POST_MARKER, "", 1)
+            attachment_paths = re.findall(r"<!-- lbo-case-attachment:(.*?) -->", raw_body)
+            body = re.sub(r"<!-- lbo-case-attachment:.*? -->", "", raw_body).strip()
             with st.container(border=True):
                 st.markdown(f"### {title}")
                 if posted_at:
                     st.caption(posted_at)
                 st.markdown(body)
+                available_attachments = [item_by_path[path] for path in attachment_paths if path in item_by_path]
+                if available_attachments:
+                    st.markdown("**Attachments**")
+                    for attachment_index, attachment in enumerate(available_attachments):
+                        attachment_cols = st.columns([4, 1])
+                        attachment_cols[0].write(f"📎 {attachment['relative']} · {human_size(attachment['size'])}")
+                        try:
+                            attachment_data = attachment["path"].read_bytes()
+                            attachment_mime = mimetypes.guess_type(attachment["name"])[0] or "application/octet-stream"
+                            attachment_cols[1].download_button(
+                                "Download",
+                                data=attachment_data,
+                                file_name=attachment["name"],
+                                mime=attachment_mime,
+                                key=f"post-attachment-{issue['number']}-{attachment_index}",
+                                use_container_width=True,
+                            )
+                        except OSError:
+                            attachment_cols[1].caption("Unavailable")
+                missing_attachments = [path for path in attachment_paths if path not in item_by_path]
+                if missing_attachments:
+                    st.caption("An attached file is no longer in the project library: " + ", ".join(missing_attachments))
     elif token and not error:
         st.info("No team posts yet. Use **Write a team post** to start the conversation.")
 
@@ -552,9 +588,9 @@ st.markdown(
 
 repo = get_setting("GITHUB_REPO", GITHUB_REPO_DEFAULT).strip()
 token = get_setting("GITHUB_TOKEN").strip()
-render_team_posts(repo, token)
-st.divider()
 items = list_content_files()
+render_team_posts(repo, token, items)
+st.divider()
 
 if repo and items:
     with st.spinner("Checking the latest file updates…"):
